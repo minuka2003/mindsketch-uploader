@@ -1,6 +1,7 @@
 """Pulls the oldest queued MP4 from Google Drive and uploads it to YouTube via Data API v3."""
 import io
 import json
+import socket
 import os
 import sys
 import tempfile
@@ -23,10 +24,21 @@ DEFAULT_PRIVACY = os.environ.get("DEFAULT_PRIVACY_STATUS", "public")
 MAX_UPLOADS_PER_RUN = int(os.environ.get("MAX_UPLOADS_PER_RUN", "1"))
 
 
+REQUIRED_SECRETS = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN")
+
+
 def get_credentials() -> Credentials:
-    client_id = os.environ["GOOGLE_CLIENT_ID"]
-    client_secret = os.environ["GOOGLE_CLIENT_SECRET"]
-    refresh_token = os.environ["GOOGLE_REFRESH_TOKEN"]
+    missing = [k for k in REQUIRED_SECRETS if not os.environ.get(k, "").strip()]
+    if missing:
+        print(
+            "ERROR: these GitHub secrets are empty or not set: " + ", ".join(missing)
+            + "\nAdd them under Settings -> Secrets and variables -> Actions (see README step 3).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    client_id = os.environ["GOOGLE_CLIENT_ID"].strip()
+    client_secret = os.environ["GOOGLE_CLIENT_SECRET"].strip()
+    refresh_token = os.environ["GOOGLE_REFRESH_TOKEN"].strip()
     creds = Credentials(
         token=None,
         refresh_token=refresh_token,
@@ -44,7 +56,7 @@ def list_queued_files(drive):
     res = drive.files().list(
         q=query,
         orderBy="createdTime asc",
-        fields="files(id, name, mimeType, parents)",
+        fields="files(id, name, mimeType, parents, appProperties)",
         pageSize=50,
     ).execute()
     return res.get("files", [])
@@ -69,6 +81,11 @@ def move_to_published(drive, file_id: str, current_parents: list):
         removeParents=prev,
         fields="id, parents",
     ).execute()
+
+
+def mark_uploaded(drive, file_id: str, video_id: str):
+    """Tag the Drive file with its YouTube ID so a failed move can never cause a duplicate upload."""
+    drive.files().update(fileId=file_id, body={"appProperties": {"youtube_id": video_id}}).execute()
 
 
 def load_metadata(drive, json_file, fallback_stem: str) -> dict:
@@ -128,7 +145,22 @@ def upload_to_youtube(youtube, video_path: str, meta: dict) -> str:
                 time.sleep(2 ** retries)
                 continue
             raise
+        except (socket.timeout, ConnectionError, OSError) as e:
+            if retries < 5:
+                retries += 1
+                print(f"Network error ({e}); retrying in {2 ** retries}s...")
+                time.sleep(2 ** retries)
+                continue
+            raise
 
+    requested = body["status"]["privacyStatus"]
+    actual = response.get("status", {}).get("privacyStatus", requested)
+    if requested != actual:
+        print(
+            f"WARNING: requested '{requested}' but YouTube set '{actual}'. If your Google Cloud project "
+            "has not passed the YouTube API audit, uploads are locked to private (see README Troubleshooting).",
+            file=sys.stderr,
+        )
     return response["id"]
 
 
@@ -149,6 +181,19 @@ def main():
         print("No queued .mp4 videos found in Google Drive Queue folder.")
         return
 
+    # Files tagged with a youtube_id were already uploaded but never moved (earlier run crashed mid-move).
+    for vf in [f for f in mp4_files if (f.get("appProperties") or {}).get("youtube_id")]:
+        stem = os.path.splitext(vf["name"])[0]
+        print(f"{vf['name']} already uploaded as {vf['appProperties']['youtube_id']}; moving to Published.")
+        move_to_published(drive, vf["id"], vf.get("parents", []))
+        json_file = json_by_stem.get(stem.lower())
+        if json_file:
+            move_to_published(drive, json_file["id"], json_file.get("parents", []))
+    mp4_files = [f for f in mp4_files if not (f.get("appProperties") or {}).get("youtube_id")]
+    if not mp4_files:
+        print("No new .mp4 videos left in the Queue folder.")
+        return
+
     for vf in mp4_files[:MAX_UPLOADS_PER_RUN]:
         stem = os.path.splitext(vf["name"])[0]
         json_file = json_by_stem.get(stem.lower())
@@ -162,6 +207,7 @@ def main():
             download_file(drive, vf["id"], video_path)
             video_id = upload_to_youtube(youtube, video_path, meta)
             print(f"SUCCESS: Published https://youtube.com/shorts/{video_id}")
+            mark_uploaded(drive, vf["id"], video_id)
 
             move_to_published(drive, vf["id"], vf.get("parents", []))
             if json_file:
