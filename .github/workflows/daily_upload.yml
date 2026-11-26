@@ -1,0 +1,33 @@
+name: Daily YouTube Shorts Uploader
+
+on:
+  schedule:
+    # Runs daily at 17:00 UTC (6:00 PM CET / 5:00 PM GMT / 10:30 PM Sri Lanka Time)
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+jobs:
+  upload-short:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Upload queued Short from Google Drive to YouTube
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_QUEUE_FOLDER_ID: "1Vbk8tyYVgoYyZDIbXdIllpZU2pducPP7"
+          DRIVE_PUBLISHED_FOLDER_ID: "14r5oeekOKaaaCahDcdNhCHuZpCa4DpmZ"
+          DEFAULT_PRIVACY_STATUS: "public"
+          MAX_UPLOADS_PER_RUN: "1"
+        run: python upload_from_drive.py
